@@ -1,315 +1,229 @@
-from google.auth.environment_vars import CREDENTIALS
-
 #!/usr/bin/env python3
-"""
-Upload ALL files from a Google Drive folder to a Google Cloud Storage bucket
-under the prefix "Phase2/". Handles both binary files (PDF, images, etc.) and
-Google Workspace files (Docs/Sheets/Slides/Drawings) via export, including
-Shared Drives.
 
-Defaults:
-  --project  adg-delivery-moniepoint
-  --bucket   adg-delivery-moniepoint-docs-bucket-001
-  --folder   19U0hhGHzpbZFuV9EqeiFyf76T31y3w7Z
-  --prefix   Phase2
-  recursive  True (descend into subfolders)
+# First, install the required packages:
+# !pip install google-cloud-documentai google-cloud-storage google-auth pandas
 
-Auth:
-  Use a Google Cloud service account JSON key with access to BOTH Drive and Storage.
-  1) Share the Drive folder (or add the SA as a member of the Shared Drive) with the SA email (Viewer+).
-  2) Grant the SA Storage permissions on the bucket (legacyBucketReader + objectAdmin or project-wide storage.admin).
-  3) Set GOOGLE_APPLICATION_CREDENTIALS to the SA JSON, or pass --credentials /path/key.json.
+import os
+from typing import List, Tuple, Dict, Any
+import pandas as pd
 
-Dependencies:
-  pip install google-api-python-client google-auth google-auth-httplib2 \
-              google-auth-oauthlib google-cloud-storage
-"""
-
-from __future__ import annotations
-
-import argparse
-import io
-import sys
-import time
-import unicodedata
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
-
-import google.auth
-from google.auth.transport.requests import Request
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from googleapiclient.errors import HttpError
+from google.cloud import documentai as docai
+from google.cloud.documentai_v1 import types
 from google.cloud import storage
-from google.api_core.exceptions import NotFound, Conflict
 
-# ---- CONFIG ----
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]  # full scope, robust for Shared Drives + export
+# --- Config (yours) ---
+# PROJECT_ID = "mptinc-playground"
+# LOCATION = "eu"  # Your processors are in EU region as shown in screenshot
+# PROCESSOR_ID = os.environ.get("DOC_OCR_PROCESSOR_ID", "vertex-pg-ai-ocr-processor")  # Use actual processor name from screenshot
+# CREDENTIALS = "/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/key.json"
+#
+# BUCKET = "gcs_document_bucket"
+# PREFIX = "12-09-2025 samples/"
 
-# Preferred export formats for Google Workspace mimeTypes
-# (mimeType -> (export_mime, extension))
-GOOGLE_EXPORTS: Dict[str, Tuple[str, str]] = {
-    "application/vnd.google-apps.document": ("application/pdf", "pdf"),  # Docs -> PDF
-    "application/vnd.google-apps.spreadsheet": (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "xlsx",
-    ),  # Sheets -> XLSX
-    "application/vnd.google-apps.presentation": ("application/pdf", "pdf"),  # Slides -> PDF
-    "application/vnd.google-apps.drawing": ("image/png", "png"),  # Drawings -> PNG
-}
+PROJECT_ID = "adg-delivery-moniepoint"
+LOCATION = "eu"
+PROCESSOR_ID = "c22f270a59d3af82"
+CREDENTIALS="/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/ProcessorTraining/.gcp/adg-documentai-sa-key.json"
+BUCKET= "adg-delivery-moniepoint-docs-bucket-001"
+PREFIX= "12-09-2025 samples/"
 
-FOLDER_MIME = "application/vnd.google-apps.folder"
-SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+# Output (local file; you can upload it to GCS after if you want)
+OUT_CSV = "kyc_tokens.csv"
 
-
-@dataclass
-class Ctx:
-    drive: Any
-    storage_client: storage.Client
-    bucket: storage.Bucket
-    prefix: str
-    recursive: bool
-    drive_id: Optional[str]  # Shared Drive id when applicable
+# File types we'll process
+VALID_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Upload ALL Drive files to GCS under Phase2 prefix")
-    p.add_argument("--project", default="mptinc-playground")
-    p.add_argument("--bucket", default="gcs_document_bucket")
-    p.add_argument("--folder", default="19U0hhGHzpbZFuV9EqeiFyf76T31y3w7Z", help="Drive folder ID")
-    p.add_argument("--prefix", default="Phase2", help="Object key prefix in GCS")
-    p.add_argument("--credentials", default=None, help="Path to service account JSON (optional)")
-    p.add_argument("--no-recursive", dest="recursive", action="store_false", help="Do not descend into subfolders")
-    args, _ = p.parse_known_args()  # Jupyter/Notebook-friendly
-    if not hasattr(args, "recursive"):
-        args.recursive = True
-    return args
+def get_mime_type(filename: str) -> str:
+    """Get MIME type based on file extension."""
+    ext = filename.lower().split('.')[-1]
+    mime_map = {
+        'pdf': 'application/pdf',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'tif': 'image/tiff',
+        'tiff': 'image/tiff',
+        'webp': 'image/webp'
+    }
+    return mime_map.get(ext, 'application/octet-stream')
 
 
-def load_credentials(json_path: Optional[str]):
-    """
-    Return credentials with DRIVE_SCOPES and a fresh access token.
-    Prefer explicit service account JSON; fall back to ADC if needed.
-    """
-    if json_path:
-        creds = service_account.Credentials.from_service_account_file(json_path, scopes=DRIVE_SCOPES)
-    else:
-        creds, _ = google.auth.default(scopes=DRIVE_SCOPES)
-
-    if not creds.valid:
-        creds.refresh(Request())
-    return creds
-
-
-def build_clients(creds, project: str):
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-    storage_client = storage.Client(project=project, credentials=creds)
-    return drive, storage_client
-
-
-def assert_drive_access(drive, folder_id: str) -> Optional[str]:
-    """
-    Ensure we can see the folder; return driveId if it's on a Shared Drive (else None).
-    """
-    try:
-        meta = drive.files().get(
-            fileId=folder_id,
-            fields="id,name,mimeType,driveId",
-            supportsAllDrives=True,
-        ).execute()
-        print(f"Drive OK: '{meta['name']}' ({meta['mimeType']}), driveId={meta.get('driveId')}")
-        return meta.get("driveId")  # None means it's in My Drive
-    except HttpError as e:
-        txt = (e.content or b"").decode("utf-8", "ignore")
-        print("Drive access check failed:", txt, file=sys.stderr)
-        raise
-
-
-def ensure_bucket(storage_client: storage.Client, bucket_name: str) -> storage.Bucket:
-    try:
-        return storage_client.get_bucket(bucket_name)
-    except NotFound:
-        print(f"Bucket '{bucket_name}' not found; creating it...", flush=True)
-        try:
-            # Set location if you need a specific region, e.g., location="africa-south1"
-            bucket = storage_client.create_bucket(bucket_name)
-            return bucket
-        except Conflict:
-            # Was created concurrently
-            return storage_client.get_bucket(bucket_name)
-
-
-def sanitize_name(name: str) -> str:
-    name = unicodedata.normalize("NFKC", name)
-    return (
-        name.replace("\\", "_")
-        .replace("/", "_")
-        .replace("\n", " ")
-        .replace("\r", " ")
-        .strip()
-    )
-
-
-def list_children(drive, folder_id: str, drive_id: Optional[str]):
-    """
-    Yield direct children of folder_id.
-    If drive_id is set, restrict query to that Shared Drive.
-    """
-    q = f"'{folder_id}' in parents and trashed = false"
-    page_token = None
-    params = dict(
-        q=q,
-        spaces="drive",
-        fields=("nextPageToken, files(id, name, mimeType, size, modifiedTime, "
-                "shortcutDetails(targetId, targetMimeType))"),
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    )
-    if drive_id:
-        params["driveId"] = drive_id
-        params["corpora"] = "drive"
-
-    while True:
-        if page_token:
-            params["pageToken"] = page_token
-        resp = drive.files().list(**params).execute()
-        for f in resp.get("files", []):
-            yield f
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
-
-def resolve_shortcut(file_obj: Dict[str, Any]) -> Dict[str, Any]:
-    # For shortcuts, substitute the target id/mimeType but keep the visible name
-    details = file_obj.get("shortcutDetails") or {}
-    target_id = details.get("targetId")
-    target_mime = details.get("targetMimeType")
-    if target_id and target_mime:
-        return {**file_obj, "id": target_id, "mimeType": target_mime}
-    return file_obj
-
-
-def export_google_file(drive, file_id: str, export_mime: str) -> bytes:
-    request = drive.files().export_media(
-        fileId=file_id,
-        mimeType=export_mime,
-        supportsAllDrives=True,
-    )
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request, chunksize=1024 * 1024)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-        if status:
-            pct = int(status.progress() * 100)
-            print(f"  Export {pct}%", end="\r", flush=True)
-    return buf.getvalue()
-
-
-def download_binary_file(drive, file_id: str) -> bytes:
-    request = drive.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request, chunksize=1024 * 1024)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-        if status:
-            pct = int(status.progress() * 100)
-            print(f"  Download {pct}%", end="\r", flush=True)
-    return buf.getvalue()
-
-
-def upload_bytes_to_gcs(bucket: storage.Bucket, blob_name: str, data: bytes, content_type: Optional[str]):
-    blob = bucket.blob(blob_name)
-    blob.cache_control = "no-store"
-    blob.upload_from_string(data, content_type=content_type)
-
-
-def gcs_key(prefix: str, path_parts: list[str]) -> str:
-    # Join with '/', avoiding doubles
-    tail = "/".join([p for p in path_parts if p])
-    return f"{prefix}/{tail}" if prefix else tail
-
-
-def process_folder(ctx: Ctx, folder_id: str, path: list[str]) -> Tuple[int, int]:
-    """Return (uploaded, skipped)."""
-    uploaded = 0
-    skipped = 0
-
-    for f in list_children(ctx.drive, folder_id, ctx.drive_id):
-        f = resolve_shortcut(f) if f.get("mimeType") == SHORTCUT_MIME else f
-        mime = f.get("mimeType")
-        name = sanitize_name(f.get("name") or f.get("id"))
-        file_id = f["id"]
-
-        if mime == FOLDER_MIME:
-            if ctx.recursive:
-                print(f"[DIR] {name}")
-                u, s = process_folder(ctx, file_id, path + [name])
-                uploaded += u
-                skipped += s
-            else:
-                print(f"Skipping subfolder (non-recursive): {name}")
-                skipped += 1
+def list_gcs_uris(bucket: str, prefix: str, storage_client: storage.Client) -> List[Tuple[str, str]]:
+    """List all valid document files in the GCS bucket with given prefix."""
+    uris = []
+    for blob in storage_client.list_blobs(bucket, prefix=prefix):
+        if blob.name.endswith("/"):
             continue
+        name_lower = blob.name.lower()
+        if any(name_lower.endswith(ext) for ext in VALID_EXTS):
+            uri = f"gs://{bucket}/{blob.name}"
+            mime_type = get_mime_type(blob.name)
+            uris.append((uri, mime_type))
+    return uris
 
-        print(f"[FILE] {name} ({mime}) id={file_id}")
 
-        try:
-            # Google Workspace export
-            if mime.startswith("application/vnd.google-apps"):
-                if mime in GOOGLE_EXPORTS:
-                    export_mime, ext = GOOGLE_EXPORTS[mime]
-                    data = export_google_file(ctx.drive, file_id, export_mime)
-                    key = gcs_key(ctx.prefix, path + [f"{name}.{ext}"])
-                    upload_bytes_to_gcs(ctx.bucket, key, data, export_mime)
-                    print(f" -> gs://{ctx.bucket.name}/{key}")
-                    uploaded += 1
-                else:
-                    print(f"  WARN: Unsupported Google file type for export: {mime}. Skipping.")
-                    skipped += 1
-            else:
-                # Binary download
-                data = download_binary_file(ctx.drive, file_id)
-                key = gcs_key(ctx.prefix, path + [name])
-                upload_bytes_to_gcs(ctx.bucket, key, data, f.get("mimeType"))
-                print(f" -> gs://{ctx.bucket.name}/{key}")
-                uploaded += 1
-        except Exception as e:
-            skipped += 1
-            print(f"  ERROR: {name}: {e}", file=sys.stderr)
+def get_text(doc: types.Document, segment: types.Document.TextAnchor) -> str:
+    """Reconstruct text for a token/paragraph/line using text segments."""
+    if not segment or not segment.text_segments:
+        return ""
+    out = []
+    text = doc.text or ""
+    for seg in segment.text_segments:
+        start = int(seg.start_index) if seg.start_index is not None else 0
+        end = int(seg.end_index) if seg.end_index is not None else 0
+        out.append(text[start:end])
+    return "".join(out)
 
-    return uploaded, skipped
+
+def norm_bbox(bbox) -> Tuple[float, float, float, float]:
+    """
+    Convert polygon (4 vertices, normalized) to (xmin, ymin, xmax, ymax), all in [0,1].
+    """
+    if not bbox or not bbox.normalized_vertices:
+        return 0.0, 0.0, 0.0, 0.0
+
+    xs = [v.x for v in bbox.normalized_vertices]
+    ys = [v.y for v in bbox.normalized_vertices]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def tokens_from_doc(doc: types.Document, gcs_uri: str) -> List[Dict[str, Any]]:
+    """
+    Extract all tokens (words) with their page, confidence, bbox.
+    """
+    rows = []
+    for page_idx, page in enumerate(doc.pages, start=1):
+        for token in page.tokens:
+            if not token.layout or not token.layout.text_anchor:
+                continue
+
+            text = get_text(doc, token.layout.text_anchor).strip()
+            if not text:
+                continue
+
+            conf = token.layout.confidence if token.layout.confidence else 0.0
+            xmin, ymin, xmax, ymax = norm_bbox(token.layout.bounding_poly)
+
+            rows.append(
+                dict(
+                    file_uri=gcs_uri,
+                    page=page_idx,
+                    token=text,
+                    confidence=conf,
+                    xmin=xmin,
+                    ymin=ymin,
+                    xmax=xmax,
+                    ymax=ymax,
+                )
+            )
+    return rows
 
 
 def main():
-    args = parse_args()
+    print("=== Google Cloud Document AI Configuration ===")
+    print(f"Project ID: {PROJECT_ID}")
+    print(f"Location: {LOCATION}")
+    print(f"Processor ID: {PROCESSOR_ID}")
+    print("=" * 50)
 
-    creds = load_credentials(args.credentials)
-    print("Scopes:", getattr(creds, "scopes", None))
-    print("Service account:", getattr(creds, "service_account_email", None))
+    if not PROCESSOR_ID:
+        raise RuntimeError(
+            "Please set your OCR processor id:\n"
+            "  export DOC_OCR_PROCESSOR_ID=<your-processor-id>\n"
+            "  or set it directly in the script"
+        )
 
-    drive, storage_client = build_clients(creds, args.project)
-    # Assert access and capture Shared Drive id (if any) BEFORE listing
-    drive_id = assert_drive_access(drive, args.folder)
-    bucket = ensure_bucket(storage_client, args.bucket)
+    # Check if credentials file exists
+    if not os.path.exists(CREDENTIALS):
+        raise RuntimeError(f"Credentials file not found: {CREDENTIALS}")
 
-    ctx = Ctx(
-        drive=drive,
-        storage_client=storage_client,
-        bucket=bucket,
-        prefix=args.prefix,
-        recursive=args.recursive,
-        drive_id=drive_id,
+    # Auth
+    creds = service_account.Credentials.from_service_account_file(CREDENTIALS)
+    storage_client = storage.Client(project=PROJECT_ID, credentials=creds)
+
+    # For EU regions, use the EU endpoint
+    client_options = {"api_endpoint": "eu-documentai.googleapis.com"}
+
+    docai_client = docai.DocumentProcessorServiceClient(
+        credentials=creds,
+        client_options=client_options
     )
 
-    start = time.time()
-    print(f"Starting upload from Drive folder {args.folder} (recursive={ctx.recursive}) → gs://{bucket.name}/{args.prefix}/")
-    uploaded, skipped = process_folder(ctx, args.folder, path=[])
-    dur = time.time() - start
-    print(f"Done. Uploaded: {uploaded}, Skipped: {skipped}, Elapsed: {dur:.1f}s")
+    processor_name = docai_client.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
+    print(f"Processor path: {processor_name}")
+
+    # Test the processor first
+    try:
+        # Try to get processor info to verify it exists
+        processor_info = docai_client.get_processor(name=processor_name)
+        print(f"Found processor: {processor_info.display_name} (Type: {processor_info.type_})")
+    except Exception as e:
+        print(f"ERROR: Cannot access processor. Details: {e}")
+        print("\nTroubleshooting steps:")
+        print("1. Verify your processor ID is correct")
+        print("2. Check that the location matches where your processor is deployed")
+        print("3. Common EU regions: eu-west1, eu-west2, eu-west3, eu-west4, eu-central1, europe-west1")
+        print("4. Run this command to list your processors:")
+        print(f"   gcloud ai document-ai processors list --location={LOCATION}")
+        return
+
+    # Gather files to process
+    try:
+        uris = list_gcs_uris(BUCKET, PREFIX, storage_client)
+    except Exception as e:
+        print(f"Error accessing GCS bucket: {e}")
+        return
+
+    if not uris:
+        print(f"No PDFs/images found under gs://{BUCKET}/{PREFIX}")
+        return
+    print(f"Found {len(uris)} files to OCR")
+
+    all_rows: List[Dict[str, Any]] = []
+
+    for idx, (uri, mime_type) in enumerate(uris, start=1):
+        print(f"[{idx}/{len(uris)}] Processing {uri}")
+
+        try:
+            # Create the request with proper MIME type
+            request = types.ProcessRequest(
+                name=processor_name,
+                gcs_document=types.GcsDocument(gcs_uri=uri, mime_type=mime_type),
+                skip_human_review=True,
+            )
+
+            # Process the document
+            result = docai_client.process_document(request=request)
+            doc = result.document
+
+            # Extract tokens
+            rows = tokens_from_doc(doc, uri)
+            all_rows.extend(rows)
+            print(f"  → Extracted {len(rows)} tokens")
+
+        except Exception as e:
+            print(f"  → Error processing {uri}: {e}")
+            continue
+
+    if not all_rows:
+        print("No tokens extracted from any documents.")
+        return
+
+    # Build dataframe and save
+    df = pd.DataFrame(all_rows, columns=[
+        "file_uri", "page", "token", "confidence", "xmin", "ymin", "xmax", "ymax"
+    ])
+    df.sort_values(["file_uri", "page"], inplace=True)
+    df.to_csv(OUT_CSV, index=False)
+
+    print(f"\nWrote token CSV: {os.path.abspath(OUT_CSV)}")
+    print(f"Total tokens extracted: {len(df)}")
+    print("Columns: file_uri,page,token,confidence,xmin,ymin,xmax,ymax")
+    print("\nNext steps:")
+    print(" - Use this CSV to build span-level labels (NER) or region labels (layout).")
+    print(" - If you want Label Studio JSON for bounding-box labeling, say the word and I'll emit it.")
 
 
 if __name__ == "__main__":
