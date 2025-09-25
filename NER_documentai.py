@@ -7,6 +7,7 @@ from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
 from dataclasses import dataclass
 import json
+import os
 
 @dataclass
 class EntityAnalysis:
@@ -869,7 +870,8 @@ def main():
 
     # Load tokens data
     try:
-        tokens_df = analyzer.load_tokens_data("kyc_tokens_documentai.csv")
+        tokens_csv = os.environ.get("TOKENS_CSV", "kyc_tokens_documentai.csv")
+        tokens_df = analyzer.load_tokens_data(tokens_csv)
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return

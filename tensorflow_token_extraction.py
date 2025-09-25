@@ -39,8 +39,9 @@ if not hasattr(fitz, "open"):
 
 # ---------- CONFIG (your defaults) ----------
 PROJECT_ID   = "mptinc-playground"
-BUCKET_NAME  = "gcs_document_bucket"
-PREFIX       = "12-09-2025 samples/"
+BUCKET = os.environ.get("BUCKET", "adg-delivery-moniepoint-docs-bucket-001")
+PREFIX = os.environ.get("PREFIX", "12-09-2025 samples/")
+OUT_CSV = os.environ.get("OUT_CSV", "kyc_tokens_tensorflow.csv")
 KEY_PATH     = "/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/key.json"
 
 # Where to save the token CSV locally (and optionally upload to GCS after)

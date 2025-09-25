@@ -22,14 +22,13 @@ from google.cloud import storage
 # PREFIX = "12-09-2025 samples/"
 
 PROJECT_ID = "adg-delivery-moniepoint"
-LOCATION = "eu"
-PROCESSOR_ID = "c22f270a59d3af82"
-CREDENTIALS="/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/ProcessorTraining/.gcp/adg-documentai-sa-key.json"
-BUCKET= "adg-delivery-moniepoint-docs-bucket-001"
-PREFIX= "12-09-2025 samples/"
-
-# Output (local file; you can upload it to GCS after if you want)
-OUT_CSV = "kyc_tokens.csv"
+PROJECT_ID = os.environ.get("PROJECT_ID", "adg-delivery-moniepoint")
+LOCATION = os.environ.get("LOCATION", "eu")
+PROCESSOR_ID = os.environ.get("PROCESSOR_ID", "c22f270a59d3af82")
+CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/ProcessorTraining/.gcp/adg-documentai-sa-key.json")
+BUCKET = os.environ.get("BUCKET", "adg-delivery-moniepoint-docs-bucket-001")
+PREFIX = os.environ.get("PREFIX", "12-09-2025 samples/")
+OUT_CSV = os.environ.get("OUT_CSV", "kyc_tokens.csv")
 
 # File types we'll process
 VALID_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
@@ -141,13 +140,12 @@ def main():
 
     # Auth
     creds = service_account.Credentials.from_service_account_file(CREDENTIALS)
-    storage_client = storage.Client(project=PROJECT_ID, credentials=creds)
+    storage_client = storage.Client(project=PROJECT_ID)
 
     # For EU regions, use the EU endpoint
     client_options = {"api_endpoint": "eu-documentai.googleapis.com"}
 
     docai_client = docai.DocumentProcessorServiceClient(
-        credentials=creds,
         client_options=client_options
     )
 
