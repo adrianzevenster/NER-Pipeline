@@ -38,16 +38,13 @@ if not hasattr(fitz, "open"):
 
 
 # ---------- CONFIG (your defaults) ----------
-PROJECT_ID   = "mptinc-playground"
+PROJECT_ID = os.environ.get("PROJECT_ID", "adg-delivery-moniepoint")
 BUCKET = os.environ.get("BUCKET", "adg-delivery-moniepoint-docs-bucket-001")
 PREFIX = os.environ.get("PREFIX", "12-09-2025 samples/")
 OUT_CSV = os.environ.get("OUT_CSV", "kyc_tokens_tensorflow.csv")
-KEY_PATH     = "/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/key.json"
-
-# Where to save the token CSV locally (and optionally upload to GCS after)
-OUT_CSV      = "kyc_tokens_tensorflow.csv"
-UPLOAD_CSV_TO_GCS = False
-OUT_CSV_GCS_PATH  = f"{PREFIX.rstrip('/')}/reports/{OUT_CSV}"
+CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/home/adrian/PycharmProjects/KYC-document-pipeline/moniepoint-document-verification-service-playground/key.json")
+UPLOAD_CSV_TO_GCS = False  # Or set via env if needed
+OUT_CSV_GCS_PATH = f"{PREFIX.rstrip('/')}/reports/{OUT_CSV}"
 
 # File types to process
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
@@ -70,8 +67,7 @@ def parse_doc_and_ref(filename: str) -> Tuple[str, str]:
     return m.group("doc").upper(), m.group("ref")
 
 def get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_file(KEY_PATH)
-    return storage.Client(project=PROJECT_ID, credentials=creds)
+    return storage.Client(project=PROJECT_ID)
 
 def list_gcs_files(bucket: storage.Bucket, prefix: str) -> List[str]:
     uris = []
@@ -268,17 +264,16 @@ def maybe_upload_csv(storage_client: storage.Client, local_path: str, bucket_nam
 
 def main():
     # Auth + clients
-    creds = service_account.Credentials.from_service_account_file(KEY_PATH)
-    storage_client = storage.Client(project=PROJECT_ID, credentials=creds)
+    storage_client = storage.Client(project=PROJECT_ID)
 
     # Build keras-ocr pipeline once (downloads detector+recognizer weights on first run)
     global pipeline
     pipeline = keras_ocr.pipeline.Pipeline()  # uses TensorFlow under the hood
 
-    bucket = storage_client.bucket(BUCKET_NAME)
+    bucket = storage_client.bucket(BUCKET)
     uris = list_gcs_files(bucket, PREFIX)
     if not uris:
-        print(f"No images/PDFs found under gs://{BUCKET_NAME}/{PREFIX}")
+        print(f"No images/PDFs found under gs://{BUCKET}/{PREFIX}")
         return
     print(f"Found {len(uris)} documents")
 
@@ -295,7 +290,7 @@ def main():
     write_rows_to_csv(all_rows, OUT_CSV)
     print(f"\nWrote: {Path(OUT_CSV).resolve()}  (rows: {len(all_rows)})")
 
-    maybe_upload_csv(storage_client, OUT_CSV, BUCKET_NAME, OUT_CSV_GCS_PATH)
+    maybe_upload_csv(storage_client, OUT_CSV, BUCKET, OUT_CSV_GCS_PATH)
     print("Done.")
 
 if __name__ == "__main__":
