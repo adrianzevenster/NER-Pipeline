@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
+import os
 
 import numpy as np
 import pandas as pd
@@ -824,6 +825,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out-csv", default="entity_analysis_by_document_type_tensorflow.csv",
                    help="CSV summary per document type")
     return p.parse_args(argv)
+
+    args.tokens = os.environ.get('TOKENS_CSV', args.tokens)
+    args.report = os.environ.get('REPORT_FILE', args.report)
+    args.out_config = os.environ.get('OUT_CONFIG', args.out_config)
+    args.out_csv = os.environ.get('OUT_CSV', args.out_csv)
 
 def main(argv=None):
     args = parse_args(argv)
