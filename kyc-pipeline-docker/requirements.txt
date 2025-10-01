@@ -1,0 +1,10 @@
+google-cloud-documentai
+google-cloud-storage
+google-auth
+pandas
+numpy
+tensorflow
+keras-ocr
+pymupdf
+opencv-python
+pillow
