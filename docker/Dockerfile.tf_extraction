@@ -1,0 +1,23 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system deps for OpenCV/PyMuPDF
+RUN apt-get update && apt-get install -y \
+    libopencv-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libopenjp2-7 \
+    libwebp-dev \
+    libmagic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/tensorflow_token_extraction.py scripts/
+COPY docker/requirements/requirements_tf.txt .
+RUN pip install --no-cache-dir -r requirements_tf.txt
+
+COPY config/ /app/config/
+
+# Entry for Cloud Run or local: expect args like script name and URI
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["tensorflow_token_extraction"]

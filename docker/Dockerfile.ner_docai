@@ -1,0 +1,12 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY scripts/NER_documentai.py scripts/
+COPY docker/requirements/requirements_ner.txt .
+RUN pip install --no-cache-dir -r requirements_ner.txt
+
+COPY config/ /app/config/
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["NER_documentai"]
