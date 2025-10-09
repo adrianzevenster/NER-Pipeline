@@ -1,0 +1,7 @@
+numpy==1.*
+opencv-python
+keras-ocr
+pymupdf
+pillow
+google-cloud-storage
+google-cloud-bigquery  # If using BQ

@@ -1,0 +1,4 @@
+pandas
+numpy
+tensorflow
+google-cloud-bigquery  # If querying BQ
